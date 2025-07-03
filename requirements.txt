@@ -1,0 +1,2 @@
+# requirements.txt
+Flask-SocketIO>=5.1
