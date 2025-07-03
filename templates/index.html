@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Blockly Offline with WebSockets</title>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        /* Main two-column container */
+        #main {
+            display: flex;
+            height: 100%;
+        }
+
+        /* Left sidebar: video + data */
+        #sidebar {
+            width: 30%;             /* adjust as you like */
+            background: #f0f0f0;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 2px 0 5px rgba(0,0,0,0.1);
+        }
+
+        #sidebar h2 {
+            margin: 10px;
+            font-size: 1.1em;
+        }
+
+        #camera {
+            width: 100%;
+            height: auto;
+            flex-shrink: 0;
+        }
+
+        #status {
+            padding: 10px;
+            font-family: monospace;
+            flex: 1;                /* take remaining vertical space */
+            overflow-y: auto;
+        }
+
+        /* Right workspace: controls + blockly */
+        #workspace {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #controls {
+            height: 40px;
+            background: #eee;
+            padding: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        #blocklyDiv {
+            flex: 1;
+        }
+    </style>
+
+    <!-- Blockly core and custom blocks -->
+    <script src="{{ url_for('static', filename='blockly/blockly_compressed.js') }}"></script>
+    <script src="{{ url_for('static', filename='blockly/blocks_compressed.js') }}"></script>
+    <script src="{{ url_for('static', filename='blockly/python_compressed.js') }}"></script>
+    <script src="{{ url_for('static', filename='blockly/msg/en.js') }}"></script>
+    <script src="{{ url_for('static', filename='blockly/custom_blocks.js') }}"></script>
+
+    <!-- Socket.IO client -->
+    <script src="{{ url_for('static', filename='socket.io/socket.io.min.js') }}"></script>
+
+    <script>
+        let workspace;
+        let socket;
+        let lastHighlighted = null;
+
+        window.addEventListener('load', () => {
+            // 1) Inject Blockly
+            const toolboxXml = `
+            <xml id="toolbox" style="display: none">
+                <category name="Robot">
+                    <block type="move_forward"></block>
+                    <block type="move_backward"></block>
+                    <block type="stop"></block>
+                    <block type="turn"></block>
+                    <block type="pan_camera"></block>
+                    <block type="tilt_camera"></block>
+                    <block type="sleep"></block>
+                    <block type="read_distance"></block>
+                    <block type="read_grayscale"></block>
+                    <block type="read_line_status"></block>
+                    <block type="read_cliff"></block>
+                    <block type="read_line"></block>
+                </category>
+                <category name="Loops" colour="%{BKY_LOOPS_HUE}">
+                    <block type="controls_whileUntil">
+                        <field name="MODE">WHILE</field>
+                        <value name="BOOL">
+                            <shadow type="logic_boolean">
+                                <field name="BOOL">TRUE</field>
+                            </shadow>
+                        </value>
+                        <statement name="DO">
+                        </statement>
+                    </block>
+                </category>
+                <category name="Logic" colour="%{BKY_LOGIC_HUE}">
+                    <!-- simple if/then -->
+                    <block type="controls_if"></block>
+                    <block type="logic_compare">
+                        <value name="A">
+                            <shadow type="math_number">
+                                <field name="NUM">0</field>
+                            </shadow>
+                        </value>
+                        <value name="B">
+                            <shadow type="math_number">
+                                <field name="NUM">0</field>
+                            </shadow>
+                        </value>
+                    </block>
+                    <!-- literal true/false -->
+                    <block type="logic_boolean"></block>
+                </category>
+                <category name="Vision" colour="#5A5">
+                    <block type="face_detect_switch"></block>
+                    <block type="traffic_detect_switch"></block>
+                    <block type="qrcode_detect_switch"></block>
+                    <block type="hands_detect_switch"></block>
+                    <block type="pose_detect_switch"></block>
+                    <block type="color_detect"></block>
+                    <block type="object_detect_switch"></block>
+                    <block type="image_classify_switch"></block>
+                </category>
+            </xml>`;
+            document.body.insertAdjacentHTML('beforeend', toolboxXml);
+
+            workspace = Blockly.inject('blocklyDiv', {
+                toolbox:    document.getElementById('toolbox'),
+                media:      '/static/blockly/media/'
+            });
+
+            // 2) Connect Socket.IO
+            socket = io();
+
+            // 3) Listen for highlight events
+            socket.on('highlight', ({ id }) => {
+                // clear previous
+                if (lastHighlighted) {
+                    workspace.highlightBlock(lastHighlighted, false);
+                }
+                lastHighlighted = id;
+                if (id) {
+                    workspace.highlightBlock(id, true);
+                }
+            });
+
+            // 4) (Optional) handle finished event
+            socket.on('finished', () => {
+                if (lastHighlighted) {
+                    workspace.highlightBlock(lastHighlighted, false);
+                    lastHighlighted = null;
+                }
+            });
+        });
+
+        // Gather commands as a flat array of {id, type, fields}
+        function gatherCommands() {
+            const cmds = [];
+            const roots = workspace.getTopBlocks(true);
+            roots.forEach(root => {
+                let block = root;
+                while (block) {
+                    const fields = {};
+                    block.inputList.forEach(input =>
+                        input.fieldRow.forEach(field => {
+                            if (field.name) {
+                                fields[field.name] = field.getValue();
+                            }
+                        })
+                    );
+                    cmds.push({
+                        id:     block.id,
+                        type:   block.type,
+                        fields: fields
+                    });
+                    block = block.getNextBlock();
+                }
+            });
+            return cmds;
+        }
+
+        function runCommands() {
+            // Serialize the entire workspace, including nested inputs (DO, BOOL, etc.)
+            const payload = Blockly.serialization.workspaces.save(workspace);
+            socket.emit('run_commands', payload);
+        }
+
+        // Stop button handler
+        function stopCommands() {
+            socket.emit('stop');
+        }
+    </script>
+</head>
+
+<body>
+    <div id="main">
+        <!-- LEFT PANEL -->
+        <div id="workspace">
+            <div id="controls">
+                <button onclick="runCommands()">Run</button>
+                <button onclick="stopCommands()">Stop</button>
+            </div>
+            <div id="blocklyDiv"></div>
+        </div>
+        <!-- RIGHT PANEL -->
+        <div id="sidebar">
+            <h2>Camera View</h2>
+            <img id="camera" src="/video_feed" alt="Camera feed">
+            <div id="status">
+            <!-- future sensor or detection data goes here -->
+            Distance: –  |  Line: –  |  Cliff: –
+            </div>
+        </div>
+    </div>
+</body>
+</html>
